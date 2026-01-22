@@ -1,41 +1,63 @@
 // app/(tabs)/explore.tsx
 
-import AsyncStorage from "@react-native-async-storage/async-storage"
 import * as Location from "expo-location"
-import React, { useEffect, useState } from "react"
+import * as SQLite from "expo-sqlite"
+import React, { useEffect, useRef, useState } from "react"
 import {
   Alert,
-  Dimensions,
   StyleSheet,
   Text,
   TouchableOpacity,
   View,
 } from "react-native"
-import MapView, { PROVIDER_GOOGLE } from "react-native-maps"
-import Svg, { Circle, Mask, Rect } from "react-native-svg"
-
-const { width, height } = Dimensions.get("window")
+import { WebView } from "react-native-webview"
 
 type Coordinate = { latitude: number; longitude: number }
 
+// Open database synchronously (Singleton)
+const db = SQLite.openDatabaseSync("exploration.db");
+
 export default function ExploreScreen() {
+  const webviewRef = useRef<WebView>(null)
+  const [isMapReady, setIsMapReady] = useState(false)
   const [location, setLocation] = useState<Coordinate | null>(null)
   const [explored, setExplored] = useState<Coordinate[]>([])
   const [isTracking, setIsTracking] = useState(false)
   const [watcher, setWatcher] = useState<Location.LocationSubscription | null>(null)
 
-  const visibilityRadius = 0.0005 // ~50m in latitude/longitude degrees
-
   useEffect(() => {
-    ;(async () => {
-      const saved = await AsyncStorage.getItem("explored-areas")
-      if (saved) setExplored(JSON.parse(saved))
-    })()
+    async function initDB() {
+      try {
+        await db.execAsync(`
+          CREATE TABLE IF NOT EXISTS explored_points (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            latitude REAL,
+            longitude REAL,
+            timestamp INTEGER
+          );
+        `);
+
+        const result = await db.getAllAsync("SELECT latitude, longitude FROM explored_points") as Coordinate[];
+        setExplored(result);
+      } catch (e) {
+        console.log("DB Init Error:", e);
+      }
+    }
+    initDB();
   }, [])
 
+  // Push updates to Web
   useEffect(() => {
-    AsyncStorage.setItem("explored-areas", JSON.stringify(explored))
-  }, [explored])
+    if (isMapReady && webviewRef.current && (location || explored.length > 0)) {
+      const data = {
+        type: 'update',
+        location: location,
+        points: explored,
+        shouldCenter: isTracking
+      }
+      webviewRef.current.postMessage(JSON.stringify(data))
+    }
+  }, [location, explored, isTracking, isMapReady])
 
   const startTracking = async () => {
     const { status } = await Location.requestForegroundPermissionsAsync()
@@ -50,13 +72,24 @@ export default function ExploreScreen() {
         timeInterval: 2000,
         distanceInterval: 10,
       },
-      (loc) => {
+      async (loc) => { // Made async for DB call
+        console.log("GPS Update:", loc.coords.latitude, loc.coords.longitude)
         const { latitude, longitude } = loc.coords
         const current = { latitude, longitude }
         setLocation(current)
 
         const isNew = !explored.some((pt) => getDistance(pt, current) < 30)
-        if (isNew) setExplored((prev) => [...prev, current])
+
+        if (isNew) {
+          try {
+            await db.runAsync("INSERT INTO explored_points (latitude, longitude, timestamp) VALUES (?, ?, ?)", [
+              latitude,
+              longitude,
+              Date.now(),
+            ])
+            setExplored((prev) => [...prev, current])
+          } catch (e) { console.log("Insert Error", e) }
+        }
       },
     )
 
@@ -73,8 +106,22 @@ export default function ExploreScreen() {
   const toggleTracking = () => (isTracking ? stopTracking() : startTracking())
 
   const reset = () => {
-    setExplored([])
-    AsyncStorage.removeItem("explored-areas")
+    Alert.alert("Reset Exploration", "Are you sure you want to clear your map?", [
+      { text: "Cancel", style: "cancel" },
+      {
+        text: "Clear",
+        style: "destructive",
+        onPress: async () => {
+          try {
+            await db.runAsync("DELETE FROM explored_points")
+            setExplored([])
+            if (webviewRef.current) {
+              webviewRef.current.postMessage(JSON.stringify({ type: 'update', points: [] }))
+            }
+          } catch (e) { console.log("Reset Error", e) }
+        },
+      },
+    ])
   }
 
   const getDistance = (a: Coordinate, b: Coordinate) => {
@@ -94,72 +141,102 @@ export default function ExploreScreen() {
 
   return (
     <View style={styles.container}>
-      <MapView
-        style={StyleSheet.absoluteFill}
-        provider={PROVIDER_GOOGLE}
-        showsUserLocation
-        followsUserLocation
-        region={
-          location
-            ? {
-                ...location,
-                latitudeDelta: 0.01,
-                longitudeDelta: 0.01,
-              }
-            : undefined
-        }
+      <WebView
+        ref={webviewRef}
+        style={styles.webview}
+        source={require('../../assets/map.html')}
+        originWhitelist={['*']}
+        javaScriptEnabled={true}
+        domStorageEnabled={true}
+        onLoadEnd={() => {
+          console.log("WebView Loaded. Waiting for Bridge...");
+          setTimeout(() => {
+            console.log("Bridge Ready.");
+            setIsMapReady(true);
+          }, 500);
+        }}
+        onError={(e) => console.log("WebView Error", e.nativeEvent)}
       />
-
-      {/* Fog Overlay */}
-      <Svg
-        width={width}
-        height={height}
-        style={StyleSheet.absoluteFill}
-        pointerEvents="none"
-      >
-        <Mask id="fogMask">
-          {/* Full black fog */}
-          <Rect width="100%" height="100%" fill="white" />
-
-          {/* Clear circles where explored */}
-          {explored.map((pt, idx) => {
-            const cx = ((pt.longitude + 180) / 360) * width
-            const cy = ((90 - pt.latitude) / 180) * height
-            return (
-              <Circle
-                key={idx}
-                cx={cx}
-                cy={cy}
-                r={60}
-                fill="black"
-                fillOpacity={1}
-              />
-            )
-          })}
-        </Mask>
-
-        <Rect
-          width="100%"
-          height="100%"
-          fill="black"
-          fillOpacity={0.6}
-          mask="url(#fogMask)"
-        />
-      </Svg>
 
       {/* Controls */}
       <View style={styles.controls}>
-        <TouchableOpacity style={styles.button} onPress={toggleTracking}>
-          <Text style={styles.buttonText}>
-            {isTracking ? "Stop" : "Start"} Exploring
-          </Text>
-        </TouchableOpacity>
+        <View style={styles.buttonRow}>
+          <TouchableOpacity style={styles.button} onPress={toggleTracking}>
+            <Text style={styles.buttonText}>
+              {isTracking ? "Stop" : "Start"} Exploring
+            </Text>
+          </TouchableOpacity>
+        </View>
+
         <TouchableOpacity
-          style={[styles.button, { backgroundColor: "#ccc" }]}
+          style={[styles.button, { backgroundColor: "#ef4444", marginTop: 10 }]}
           onPress={reset}
         >
-          <Text style={styles.buttonText}>Reset</Text>
+          <Text style={styles.buttonText}>Reset Map</Text>
         </TouchableOpacity>
+
+        {/* Dev Tools for Verification */}
+        <View style={styles.devTools}>
+          <Text style={styles.devTitle}>Dev Tools</Text>
+          <View style={styles.buttonRow}>
+            <TouchableOpacity
+              style={[styles.smallButton, { backgroundColor: "#10b981" }]}
+              onPress={async () => {
+                // Simulate adding points nearby
+                const isFallback = !location
+                const baseLat = location?.latitude || 22.3149 // Fallback to KGP
+                const baseLon = location?.longitude || 87.3105
+                const newPoints: Coordinate[] = []
+
+                // Add 5 points in a small line
+                for (let i = 0; i < 5; i++) {
+                  newPoints.push({
+                    latitude: baseLat + (i * 0.0002),
+                    longitude: baseLon + (i * 0.0002)
+                  })
+                }
+
+                // Insert into DB
+                try {
+                  for (const p of newPoints) {
+                    await db.runAsync("INSERT INTO explored_points (latitude, longitude, timestamp) VALUES (?, ?, ?)", [
+                      p.latitude,
+                      p.longitude,
+                      Date.now(),
+                    ])
+                  }
+                  // Update UI
+                  setExplored(prev => [...prev, ...newPoints])
+
+                  Alert.alert(
+                    "Simulated",
+                    isFallback ? "Added points at KGP (Fallback)." : "Added 5 test points."
+                  )
+                } catch (e) { console.log("Sim Error", e) }
+              }}
+            >
+              <Text style={styles.smallButtonText}>+ Simulate Walk</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={[styles.smallButton, { backgroundColor: "#8b5cf6" }]}
+              onPress={() => {
+                // Clear state and force reload from DB
+                setExplored([])
+                setTimeout(async () => {
+                  try {
+                    const result = await db.getAllAsync("SELECT latitude, longitude FROM explored_points") as Coordinate[]
+                    setExplored(result)
+                    Alert.alert("Reloaded", `Synced ${result.length} points to Web Map.`)
+                  } catch (e) { console.log("Reload Error", e) }
+                }, 500)
+              }}
+            >
+              <Text style={styles.smallButtonText}>↻ Sync Web</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+
         <Text style={styles.status}>Explored: {explored.length} points</Text>
       </View>
     </View>
@@ -168,19 +245,31 @@ export default function ExploreScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1 },
+  webview: { flex: 1 },
   controls: {
     position: "absolute",
-    bottom: 40,
+    bottom: 30,
     left: 20,
     right: 20,
     alignItems: "center",
+    backgroundColor: 'rgba(255,255,255,0.9)',
+    padding: 15,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: '#ddd'
+  },
+  buttonRow: {
+    flexDirection: "row",
+    gap: 10,
+    width: "100%",
+    justifyContent: "center",
   },
   button: {
     backgroundColor: "#3b82f6",
     padding: 12,
     borderRadius: 8,
-    marginBottom: 10,
-    width: "80%",
+    flex: 1,
+    alignItems: 'center'
   },
   buttonText: {
     color: "white",
@@ -189,118 +278,33 @@ const styles = StyleSheet.create({
   },
   status: {
     color: "#333",
-    marginTop: 5,
+    marginTop: 10,
+    fontSize: 12,
   },
+  devTools: {
+    marginTop: 15,
+    width: "100%",
+    borderTopWidth: 1,
+    borderTopColor: "#eee",
+    paddingTop: 10,
+    alignItems: "center"
+  },
+  devTitle: {
+    fontSize: 10,
+    fontWeight: "bold",
+    color: "#888",
+    marginBottom: 5,
+    textTransform: "uppercase"
+  },
+  smallButton: {
+    padding: 8,
+    borderRadius: 6,
+    minWidth: 100,
+    alignItems: 'center'
+  },
+  smallButtonText: {
+    color: "white",
+    fontWeight: "bold",
+    fontSize: 12
+  }
 })
-
-
-// import { Image } from 'expo-image';
-// import { Platform, StyleSheet } from 'react-native';
-
-// import { Collapsible } from '@/components/Collapsible';
-// import { ExternalLink } from '@/components/ExternalLink';
-// import ParallaxScrollView from '@/components/ParallaxScrollView';
-// import { ThemedText } from '@/components/ThemedText';
-// import { ThemedView } from '@/components/ThemedView';
-// import { IconSymbol } from '@/components/ui/IconSymbol';
-
-// export default function TabTwoScreen() {
-//   return (
-//     <ParallaxScrollView
-//       headerBackgroundColor={{ light: '#D0D0D0', dark: '#353636' }}
-//       headerImage={
-//         <IconSymbol
-//           size={310}
-//           color="#808080"
-//           name="chevron.left.forwardslash.chevron.right"
-//           style={styles.headerImage}
-//         />
-//       }>
-//       <ThemedView style={styles.titleContainer}>
-//         <ThemedText type="title">Explore</ThemedText>
-//       </ThemedView>
-//       <ThemedText>This app includes example code to help you get started.</ThemedText>
-//       <Collapsible title="File-based routing">
-//         <ThemedText>
-//           This app has two screens:{' '}
-//           <ThemedText type="defaultSemiBold">app/(tabs)/index.tsx</ThemedText> and{' '}
-//           <ThemedText type="defaultSemiBold">app/(tabs)/explore.tsx</ThemedText>
-//         </ThemedText>
-//         <ThemedText>
-//           The layout file in <ThemedText type="defaultSemiBold">app/(tabs)/_layout.tsx</ThemedText>{' '}
-//           sets up the tab navigator.
-//         </ThemedText>
-//         <ExternalLink href="https://docs.expo.dev/router/introduction">
-//           <ThemedText type="link">Learn more</ThemedText>
-//         </ExternalLink>
-//       </Collapsible>
-//       <Collapsible title="Android, iOS, and web support">
-//         <ThemedText>
-//           You can open this project on Android, iOS, and the web. To open the web version, press{' '}
-//           <ThemedText type="defaultSemiBold">w</ThemedText> in the terminal running this project.
-//         </ThemedText>
-//       </Collapsible>
-//       <Collapsible title="Images">
-//         <ThemedText>
-//           For static images, you can use the <ThemedText type="defaultSemiBold">@2x</ThemedText> and{' '}
-//           <ThemedText type="defaultSemiBold">@3x</ThemedText> suffixes to provide files for
-//           different screen densities
-//         </ThemedText>
-//         <Image source={require('@/assets/images/react-logo.png')} style={{ alignSelf: 'center' }} />
-//         <ExternalLink href="https://reactnative.dev/docs/images">
-//           <ThemedText type="link">Learn more</ThemedText>
-//         </ExternalLink>
-//       </Collapsible>
-//       <Collapsible title="Custom fonts">
-//         <ThemedText>
-//           Open <ThemedText type="defaultSemiBold">app/_layout.tsx</ThemedText> to see how to load{' '}
-//           <ThemedText style={{ fontFamily: 'SpaceMono' }}>
-//             custom fonts such as this one.
-//           </ThemedText>
-//         </ThemedText>
-//         <ExternalLink href="https://docs.expo.dev/versions/latest/sdk/font">
-//           <ThemedText type="link">Learn more</ThemedText>
-//         </ExternalLink>
-//       </Collapsible>
-//       <Collapsible title="Light and dark mode components">
-//         <ThemedText>
-//           This template has light and dark mode support. The{' '}
-//           <ThemedText type="defaultSemiBold">useColorScheme()</ThemedText> hook lets you inspect
-//           what the user&apos;s current color scheme is, and so you can adjust UI colors accordingly.
-//         </ThemedText>
-//         <ExternalLink href="https://docs.expo.dev/develop/user-interface/color-themes/">
-//           <ThemedText type="link">Learn more</ThemedText>
-//         </ExternalLink>
-//       </Collapsible>
-//       <Collapsible title="Animations">
-//         <ThemedText>
-//           This template includes an example of an animated component. The{' '}
-//           <ThemedText type="defaultSemiBold">components/HelloWave.tsx</ThemedText> component uses
-//           the powerful <ThemedText type="defaultSemiBold">react-native-reanimated</ThemedText>{' '}
-//           library to create a waving hand animation.
-//         </ThemedText>
-//         {Platform.select({
-//           ios: (
-//             <ThemedText>
-//               The <ThemedText type="defaultSemiBold">components/ParallaxScrollView.tsx</ThemedText>{' '}
-//               component provides a parallax effect for the header image.
-//             </ThemedText>
-//           ),
-//         })}
-//       </Collapsible>
-//     </ParallaxScrollView>
-//   );
-// }
-
-// const styles = StyleSheet.create({
-//   headerImage: {
-//     color: '#808080',
-//     bottom: -90,
-//     left: -35,
-//     position: 'absolute',
-//   },
-//   titleContainer: {
-//     flexDirection: 'row',
-//     gap: 8,
-//   },
-// });
